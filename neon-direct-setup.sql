@@ -1,3 +1,7 @@
+-- Paste this full SQL into Neon SQL Editor, then run it once.
+-- This app stores shared admin settings, packages, device locks,
+-- and user activity logs in one JSONB row: app_store.id = 'main'.
+
 create table if not exists app_store (
   id text primary key,
   data jsonb not null default '{}'::jsonb,
@@ -10,3 +14,7 @@ on conflict (id) do nothing;
 
 create index if not exists app_store_updated_at_idx
   on app_store (updated_at desc);
+
+select id, updated_at, jsonb_typeof(data) as data_type
+from app_store
+where id = 'main';
