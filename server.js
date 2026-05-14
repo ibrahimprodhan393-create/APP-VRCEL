@@ -853,6 +853,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = {
-  handleHttpRequest
-};
+module.exports = handleHttpRequest;
+module.exports.handleHttpRequest = handleHttpRequest;
