@@ -9,11 +9,16 @@ const MAX_FINAL_LOADING_MINUTES = 80;
 const ACTION_DELAY_MIN_MS = 2000;
 const ACTION_DELAY_MAX_MS = 5000;
 const FINAL_PHASE_MINUTES = 10;
-const USER_PACKAGE_SYNC_MS = 5000;
-const ADMIN_SYNC_MS = 5000;
+const USER_PACKAGE_SYNC_MS = 15000;
+const ADMIN_SYNC_MS = 10000;
 const FEATURE_IMAGE_MAX_SIZE = 256;
 const FEATURE_IMAGE_QUALITY = 0.86;
 const API_BASE_URL = String(window.HYPER_API_BASE_URL || "").replace(/\/+$/, "");
+const API_TIMEOUT_MS = 15000;
+const LOCAL_HOSTS = new Set(["", "localhost", "127.0.0.1", "hyper-regedit.local"]);
+const ONLINE_REQUIRED =
+  Boolean(API_BASE_URL) ||
+  (window.location.protocol.startsWith("http") && !LOCAL_HOSTS.has(window.location.hostname));
 const FINAL_PHASE_MESSAGES = [
   "Security Protection Checking",
   "Device Module Checking",
@@ -416,11 +421,23 @@ async function apiRequest(path, { method = "GET", body, token = adminToken } = {
   }
 
   const requestPath = API_BASE_URL && path.startsWith("/") ? `${API_BASE_URL}${path}` : path;
-  const response = await fetch(requestPath, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body)
-  });
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(requestPath, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    const wrapped = new Error(error.name === "AbortError" ? "Online server timeout" : "Online server unavailable");
+    wrapped.status = 0;
+    throw wrapped;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
   const contentType = response.headers.get("content-type") || "";
   const isJson = contentType.toLowerCase().includes("application/json");
   const payload = isJson ? await response.json().catch(() => ({})) : {};
@@ -464,7 +481,7 @@ function queueAdminSave() {
 }
 
 function isMissingApiError(error) {
-  return error?.status === 404 || error?.status === 405;
+  return !ONLINE_REQUIRED && (error?.status === 404 || error?.status === 405);
 }
 
 async function logUserActivity(type, message, details = {}) {
@@ -612,6 +629,10 @@ async function loginWithServer(username, password) {
       setMessage(elements.loginMessage, error.message || "Login failed");
       return true;
     }
+    if (ONLINE_REQUIRED) {
+      setMessage(elements.loginMessage, error.message || "Online server unavailable");
+      return true;
+    }
     backendOnline = false;
   }
 
@@ -635,6 +656,10 @@ async function verifyServerAccess(path, body, messageElement, fallbackMessage) {
 
     if (error.status) {
       setMessage(messageElement, error.message || fallbackMessage);
+      return false;
+    }
+    if (ONLINE_REQUIRED) {
+      setMessage(messageElement, error.message || "Online server unavailable");
       return false;
     }
     return null;

@@ -13,11 +13,20 @@ const DEFAULT_ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "ADMIN-2026";
 const ADMIN_SESSION_MS = 12 * 60 * 60 * 1000;
 const MAX_JSON_BODY_BYTES = 5_000_000;
 const MAX_ACTIVITY_ITEMS = 250;
+const STORE_CACHE_MS = Math.max(0, Number(process.env.STORE_CACHE_MS || 3000));
+const DB_AUTO_SCHEMA = process.env.DB_AUTO_SCHEMA !== "false";
+const DB_QUERY_TIMEOUT_MS = Math.max(1000, Number(process.env.DB_QUERY_TIMEOUT_MS || 8000));
+const STRICT_ONLINE_STORAGE =
+  process.env.STRICT_ONLINE_STORAGE === "true" ||
+  (Boolean(process.env.VERCEL) && process.env.STRICT_ONLINE_STORAGE !== "false");
 
 const sessions = new Map();
 let writeQueue = Promise.resolve();
 let dbPool = null;
+let dbSql = null;
 let dbReady = false;
+let storeCache = null;
+let storeCacheExpiresAt = 0;
 
 function getDatabaseConfig(connectionString) {
   const parsed = new URL(connectionString);
@@ -34,13 +43,24 @@ function getDatabaseConfig(connectionString) {
 }
 
 if (DATABASE_URL) {
-  const { Pool } = require("pg");
-  dbPool = new Pool({
-    ...getDatabaseConfig(DATABASE_URL),
-    max: 5,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-  });
+  try {
+    const { neon } = require("@neondatabase/serverless");
+    dbSql = neon(DATABASE_URL);
+  } catch (error) {
+    const { Pool } = require("pg");
+    dbPool = new Pool({
+      ...getDatabaseConfig(DATABASE_URL),
+      max: Number(process.env.PG_POOL_MAX || 1),
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
+    });
+  }
+}
+
+function getStorageMode() {
+  if (dbSql) return "neon-http";
+  if (dbPool) return "postgres-pool";
+  return "file";
 }
 
 function seedData() {
@@ -281,13 +301,64 @@ function preserveStoredPackageServerState(incomingData = {}, storedData = {}) {
   };
 }
 
-async function readStore() {
-  if (dbPool) {
+function cloneData(data) {
+  return JSON.parse(JSON.stringify(data));
+}
+
+function updateStoreCache(data) {
+  const normalized = normalizeData(data);
+  storeCache = cloneData(normalized);
+  storeCacheExpiresAt = Date.now() + STORE_CACHE_MS;
+  return normalized;
+}
+
+async function queryStoreRow() {
+  if (dbSql) {
+    const rows = await withDatabaseTimeout(dbSql("select data from app_store where id = $1", [STORE_ID]), "read store");
+    return rows[0];
+  }
+
+  const result = await withDatabaseTimeout(dbPool.query("select data from app_store where id = $1", [STORE_ID]), "read store");
+  return result.rows[0];
+}
+
+async function upsertStoreRow(normalized) {
+  const payload = JSON.stringify(normalized);
+  const statement = `
+    insert into app_store (id, data, updated_at)
+    values ($1, $2::jsonb, now())
+    on conflict (id)
+    do update set data = excluded.data, updated_at = now()
+  `;
+
+  if (dbSql) {
+    await withDatabaseTimeout(dbSql(statement, [STORE_ID, payload]), "write store");
+    return;
+  }
+
+  await withDatabaseTimeout(dbPool.query(statement, [STORE_ID, payload]), "write store");
+}
+
+function withDatabaseTimeout(promise, label = "database query") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${DB_QUERY_TIMEOUT_MS}ms`)), DB_QUERY_TIMEOUT_MS);
+    })
+  ]);
+}
+
+async function readStore({ allowCache = true } = {}) {
+  if (allowCache && storeCache && Date.now() < storeCacheExpiresAt) {
+    return cloneData(storeCache);
+  }
+
+  if (dbSql || dbPool) {
     try {
       await ensureDatabaseStore();
-      const result = await dbPool.query("select data from app_store where id = $1", [STORE_ID]);
-      if (result.rows[0]?.data) {
-        return normalizeData(result.rows[0].data);
+      const row = await queryStoreRow();
+      if (row?.data) {
+        return cloneData(updateStoreCache(row.data));
       }
 
       const seeded = normalizeData(seedData());
@@ -295,7 +366,12 @@ async function readStore() {
       return seeded;
     } catch (error) {
       console.error("Neon read failed, falling back to file storage:", error.message);
+      if (STRICT_ONLINE_STORAGE) {
+        throw new Error(`Online database read failed: ${error.message}`);
+      }
     }
+  } else if (STRICT_ONLINE_STORAGE) {
+    throw new Error("DATABASE_URL is not configured for online storage");
   }
 
   try {
@@ -311,35 +387,48 @@ async function readStore() {
 async function writeStore(data) {
   const normalized = normalizeData(data);
 
-  if (dbPool) {
+  if (dbSql || dbPool) {
     try {
       await ensureDatabaseStore();
-      await dbPool.query(
-        `insert into app_store (id, data, updated_at)
-         values ($1, $2::jsonb, now())
-         on conflict (id)
-         do update set data = excluded.data, updated_at = now()`,
-        [STORE_ID, JSON.stringify(normalized)]
-      );
+      await upsertStoreRow(normalized);
+      updateStoreCache(normalized);
       return;
     } catch (error) {
       console.error("Neon write failed, falling back to file storage:", error.message);
+      if (STRICT_ONLINE_STORAGE) {
+        throw new Error(`Online database write failed: ${error.message}`);
+      }
     }
+  } else if (STRICT_ONLINE_STORAGE) {
+    throw new Error("DATABASE_URL is not configured for online storage");
   }
 
   await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
   await fs.writeFile(DATA_FILE, JSON.stringify(normalized, null, 2));
+  updateStoreCache(normalized);
 }
 
 async function ensureDatabaseStore() {
-  if (!dbPool || dbReady) return;
-  await dbPool.query(`
+  if ((!dbSql && !dbPool) || dbReady || !DB_AUTO_SCHEMA) return;
+  const tableSql = `
     create table if not exists app_store (
       id text primary key,
       data jsonb not null,
       updated_at timestamptz not null default now()
     )
-  `);
+  `;
+  const seedSql = `
+    insert into app_store (id, data)
+    values ($1, '{}'::jsonb)
+    on conflict (id) do nothing
+  `;
+  if (dbSql) {
+    await withDatabaseTimeout(dbSql(tableSql), "create store table");
+    await withDatabaseTimeout(dbSql(seedSql, [STORE_ID]), "seed store row");
+  } else {
+    await withDatabaseTimeout(dbPool.query(tableSql), "create store table");
+    await withDatabaseTimeout(dbPool.query(seedSql, [STORE_ID]), "seed store row");
+  }
   dbReady = true;
 }
 
@@ -494,9 +583,34 @@ function packageActivityFields(pkg = {}) {
   };
 }
 
+async function checkDatabaseStatus() {
+  if (!dbSql && !dbPool) {
+    return { ok: false, status: "missing_database_url" };
+  }
+
+  try {
+    if (dbSql) {
+      await withDatabaseTimeout(dbSql("select 1 as ok"), "database health check");
+    } else {
+      await withDatabaseTimeout(dbPool.query("select 1 as ok"), "database health check");
+    }
+    return { ok: true, status: "connected" };
+  } catch (error) {
+    return { ok: false, status: "error", message: error.message };
+  }
+}
+
 async function handleApi(req, res, pathname) {
   if (req.method === "GET" && pathname === "/api/health") {
-    return sendJson(res, 200, { ok: true });
+    const database = await checkDatabaseStatus();
+    const ok = database.ok || (!STRICT_ONLINE_STORAGE && !DATABASE_URL);
+    return sendJson(res, ok ? 200 : 500, {
+      ok,
+      storageMode: getStorageMode(),
+      databaseConfigured: Boolean(DATABASE_URL),
+      strictOnlineStorage: STRICT_ONLINE_STORAGE,
+      database
+    });
   }
 
   if (req.method === "GET" && pathname === "/api/public") {
@@ -513,19 +627,14 @@ async function handleApi(req, res, pathname) {
     const password = String(body.password || "").trim();
     const deviceId = String(body.deviceId || "").trim();
 
-    return withStoreUpdate((data) => {
+    return writeQueue = writeQueue.then(async () => {
+      const data = await readStore();
+      let shouldWrite = false;
       const adminUsername = String(data.settings?.adminUsername || "admin").trim();
       const adminPassword = String(data.settings?.adminPassword ?? DEFAULT_ADMIN_PASSWORD).trim();
       const isConfiguredAdmin =
         username.toLowerCase() === adminUsername.toLowerCase() && password === adminPassword;
       if (isConfiguredAdmin) {
-        recordActivity(data, {
-          type: "admin_login",
-          status: "success",
-          username,
-          message: "Admin logged in",
-          details: getRequestDetails(req)
-        });
         return sendJson(res, 200, {
           role: "admin",
           token: createAdminSession(),
@@ -537,29 +646,14 @@ async function handleApi(req, res, pathname) {
       if (pkg && !data.packages.some((item) => item.id === pkg.id)) {
         data.packages.push(pkg);
         pkg = data.packages[data.packages.length - 1];
+        shouldWrite = true;
       }
       if (!pkg) {
-        recordActivity(data, {
-          type: "login_failed",
-          status: "failed",
-          username,
-          deviceId,
-          message: "Incorrect username or password",
-          details: getRequestDetails(req)
-        });
         return sendJson(res, 401, { message: "Incorrect username or password" });
       }
 
       const accessError = verifyPackageDevice(pkg, deviceId);
       if (accessError) {
-        recordActivity(data, {
-          type: "login_blocked",
-          status: "failed",
-          ...packageActivityFields(pkg),
-          deviceId,
-          message: accessError,
-          details: getRequestDetails(req)
-        });
         return sendJson(res, accessError.includes("Already") ? 409 : 403, { message: accessError });
       }
 
@@ -574,16 +668,10 @@ async function handleApi(req, res, pathname) {
           message: "Package locked to this device",
           details: getRequestDetails(req)
         });
+        shouldWrite = true;
       }
 
-      recordActivity(data, {
-        type: "user_login",
-        status: "success",
-        ...packageActivityFields(pkg),
-        deviceId,
-        message: "User logged in",
-        details: getRequestDetails(req)
-      });
+      if (shouldWrite) await writeStore(data);
 
       return sendJson(res, 200, {
         role: "user",

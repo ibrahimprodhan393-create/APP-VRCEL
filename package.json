@@ -8,9 +8,10 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
     "pg": "^8.13.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": "20.x"
   }
 }
